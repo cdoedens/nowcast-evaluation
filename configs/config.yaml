@@ -1,0 +1,22 @@
+# metrics to calculate and plot
+metrics:
+# starting with two, can add more later
+  - rmse
+  - mae
+  # - fss
+  # - crps
+  # - ssim
+
+# NAME: PATH for models to evaluate
+models:
+    GSO_OF: /g/data/er8/nowcasts/nwc_20240701_20251231
+    # add more here as they become available
+
+truth: /g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s/latest
+variable_name: surface_global_irradiance # should be the same in all datasets
+
+
+
+evaluation_year: 2025
+bounds: [-35, -22, 138.5, 151.5]
+max_lead_time: 180 # minutes
