@@ -22,21 +22,27 @@ def file_name_to_datetime64(file_path):
 
     return np.datetime64(f'{year}-{month}-{day}T{hour}:{minute}')
 
-def datetime_to_lead_time(ds):
+def preprocess_nowcast_dataset(
+    ds,
+    f_dim_name, # name of forecast dim in the netcdf file
+    new_f_dim_name, # name to use for forecast dim in xarray
+    relative_leadtime=False):
     '''
-    Convert times in absoluate datetime formate to lead time ahead of the time that the forecast was made. Allows easier comparison with model forecasts.
+    Adds a time dimension to the dataset using the filename.
+
+    If relative_leadtime=True, converts times in the forecast_time dimension from absolute time values
+    to times relative to "time", i.e. time since forecast intialised
     '''
     file_path = Path(ds.encoding["source"])
     t0 = file_name_to_datetime64(file_path)
 
     # Rename original time → forecast_time
-    ds = ds.rename({'time': 'forecast_time'})
+    ds = ds.rename({f_dim_name: new_f_dim_name})
 
-    # Convert to lead time (timedelta)
-    lead_time = ds['forecast_time'] - t0
+    if relative_leadtime:
+        # Convert to lead time (timedelta)
+        lead_time = ds[new_f_dim_name] - t0
+        ds = ds.assign_coords({new_f_dim_name:lead_time})
 
-    return (
-        ds
-        .assign_coords(forecast_time=lead_time)
-        .expand_dims(time=[t0])
-    )
+    return ds.expand_dims(time=[t0])
+
