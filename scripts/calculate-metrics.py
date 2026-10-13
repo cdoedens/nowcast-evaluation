@@ -1,8 +1,13 @@
 """Calculate error metrics for solar irradiance nowcasts against satellite-derived truth.
 
 For every day of the requested year, the DiT and GSO optical-flow (GSO-OF) nowcasts are
-compared with the Himawari truth product. Metrics are computed per lead time, concatenated
-along a `date` dimension and saved as one NetCDF file per model.
+compared with the Himawari truth product. GSO-OF is only evaluated at the DiT issue times,
+so both models are scored on the same forecasts.
+
+Metrics are saved per forecast, i.e. with dims (time, lead_time) where `time` is the issue
+time, as one NetCDF file per model per day. Forecasts without a complete truth field are
+flagged with `valid = 0` and have NaN metrics. FSS is saved as its decomposed components so
+it can be pooled over any set of forecasts; see `metric_aggregation.py` in src/.
 """
 
 import argparse
@@ -15,7 +20,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from dask.distributed import Client
-from scores.spatial import fss_2d
 from skimage.metrics import structural_similarity
 
 warnings.filterwarnings("ignore")
@@ -28,12 +32,18 @@ LOG = logger.get_logger(__name__)
 
 VARIABLE = "surface_global_irradiance"
 
-DIT_DIR = Path("/scratch/er8/cd3022/CPDiT/v0.1.0/inference")
+DIT_DIR = Path("/scratch/er8/cd3022/CPDiT/inference")
 GSO_OF_DIR = Path("/g/data/er8/nowcasts/nwc_20240701_20251231")
+# Truth directories are organised by local (Australian) day, e.g. 2025/01/15 holds
+# 2025-01-14T18:30 to 2025-01-15T11:30 UTC, whereas the nowcasts are organised by UTC day
 TRUTH_DIR = Path("/g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s/latest")
-SAVE_DIR = Path("/scratch/er8/cd3022/nowcast-evaluation/error-metric-data")
+SAVE_DIR = Path("/scratch/er8/cd3022/nowcast-evaluation/error-metric-data/per-forecast")
 
 SPATIAL_DIMS = ["latitude", "longitude"]
+
+# Buffer (degrees) removed from each edge of the DiT domain so evaluation is not
+# impacted by boundary effects
+DOMAIN_BUFFER = 1.0
 
 
 # DATA LOADING
@@ -47,7 +57,7 @@ def _crop_to_region(ds: xr.Dataset, bounds: dict) -> xr.Dataset:
     return ds.sel(
         latitude=_region_slice(ds["latitude"], bounds["lat_min"], bounds["lat_max"]),
         longitude=_region_slice(ds["longitude"], bounds["lon_min"], bounds["lon_max"]),
-    )[[VARIABLE]]
+    )[[VARIABLE]].reset_coords(drop=True)
 
 
 def preprocess_dit(ds: xr.Dataset) -> xr.Dataset:
@@ -56,7 +66,8 @@ def preprocess_dit(ds: xr.Dataset) -> xr.Dataset:
         f_dim_name="lead_time",
         new_f_dim_name="lead_time",
     )
-    return ds[[VARIABLE]].mean(dim="member")
+    # Drop non-index coords (init_time, valid_time) so they don't leak into the metrics
+    return ds[[VARIABLE]].mean(dim="member").reset_coords(drop=True)
 
 
 def preprocess_gso_of(ds: xr.Dataset, bounds: dict) -> xr.Dataset:
@@ -88,7 +99,60 @@ def open_files(files: list[Path], preprocess) -> xr.Dataset:
     )
 
 
+def _files_at_times(files: list[Path], times: set[pd.Timestamp], time_fmt: str) -> list[Path]:
+    """Keep the files whose timestamp (parsed from the file name) is in `times`."""
+    return [f for f in files if pd.to_datetime(f.stem, format=time_fmt) in times]
+
+
+def _truth_file_time(path: Path) -> pd.Timestamp:
+    """Truth files are named IDE00326.YYYYmmddHHMM.nc"""
+    return pd.to_datetime(path.stem.split(".")[1], format="%Y%m%d%H%M")
+
+
 # METRIC CALCULATION
+def _fss_components_2d(
+    f: np.ndarray, o: np.ndarray, threshold: float, window: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Decomposed FSS components for each (lat, lon) field in the trailing two axes.
+
+    Follows the `scores.spatial.fss_2d` definition (event = value > threshold, windows
+    restricted to the interior of the domain), but returns the components per field:
+    mean(Pf^2), mean(Po^2) and mean((Pf - Po)^2), where P are neighbourhood event
+    fractions. FSS over any set of fields is 1 - sum(diff) / (sum(fcst) + sum(obs)).
+    """
+    wh, ww = window
+
+    def fractions(x: np.ndarray) -> np.ndarray:
+        events = (x > threshold).astype(np.float64)
+        csum = np.pad(events.cumsum(-2).cumsum(-1), [(0, 0)] * (x.ndim - 2) + [(1, 0), (1, 0)])
+        window_sum = (
+            csum[..., wh:, ww:] - csum[..., :-wh, ww:] - csum[..., wh:, :-ww] + csum[..., :-wh, :-ww]
+        )
+        return window_sum / (wh * ww)
+
+    pf, po = fractions(f), fractions(o)
+    spatial_axes = (-2, -1)
+    return (
+        np.mean(pf**2, axis=spatial_axes),
+        np.mean(po**2, axis=spatial_axes),
+        np.mean((pf - po) ** 2, axis=spatial_axes),
+    )
+
+
+def fss_components(
+    f: xr.DataArray, o: xr.DataArray, threshold: float, window: tuple[int, int]
+) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
+    """FSS components (fcst, obs, diff) for each (lat, lon) field."""
+    return xr.apply_ufunc(
+        _fss_components_2d,
+        f,
+        o,
+        input_core_dims=[SPATIAL_DIMS, SPATIAL_DIMS],
+        output_core_dims=[[], [], []],
+        kwargs={"threshold": threshold, "window": window},
+    )
+
+
 def _ssim_2d(f2d: np.ndarray, o2d: np.ndarray, data_range: float, sigma: float) -> float:
     """SSIM for a single (lat, lon) field. NaN if either field has missing data."""
     if np.isnan(f2d).any() or np.isnan(o2d).any():
@@ -126,12 +190,13 @@ def calc_error_metrics(
     ssim_data_range: float = 1200,  # W/m2, range of values in image
     ssim_sigma: float = 1.5,
 ) -> xr.Dataset:
-    """Return RMSE, MAE, FSS (small/large window) and SSIM, each as a function of lead time.
+    """Return per-forecast MSE, MAE, SSIM and FSS components (small/large window).
 
     `fcst` has dims (time, lead_time, latitude, longitude), where `time` is the issue time.
     `obs` has dims (time, latitude, longitude), where `time` is the valid time.
-    RMSE and SSIM are calculated per forecast then averaged over issue times; MAE is
-    averaged over all times and grid points.
+    The output has dims (time, lead_time). A forecast is only scored (`valid` = 1) when both
+    the forecast and the observed field at its valid time are complete; otherwise all of its
+    metrics are NaN. Missing data must not be scored: FSS would treat it as "no event".
     """
     # Put obs on exactly the forecast grid (guards against float coordinate mismatch)
     obs = obs.sel(
@@ -147,101 +212,131 @@ def calc_error_metrics(
         o = obs.reindex(time=f["time"].values + lead)
         o = o.assign_coords(time=f["time"].values).load()
 
-        err = f - o
-        fss_kwargs = {
-            "event_threshold": fss_threshold,
-            "spatial_dims": SPATIAL_DIMS,
-        }
-        per_lead.append(
-            xr.Dataset(
-                {
-                    "rmse": np.sqrt((err**2).mean(dim=SPATIAL_DIMS)).mean(dim="time"),
-                    "mae": np.abs(err).mean(dim=[*SPATIAL_DIMS, "time"]),
-                    "fss_small": fss_2d(f, o, window_size=fss_window_small, **fss_kwargs),
-                    "fss_large": fss_2d(f, o, window_size=fss_window_large, **fss_kwargs),
-                    "ssim": ssim_field(
-                        f, o, data_range=ssim_data_range, sigma=ssim_sigma
-                    ).mean(dim="time"),
-                }
-            )
-        )
+        valid = f.notnull().all(dim=SPATIAL_DIMS) & o.notnull().all(dim=SPATIAL_DIMS)
 
-    return xr.concat(per_lead, dim=fcst["lead_time"])
+        err = f - o
+        metrics = {
+            "valid": valid.astype(np.int8),
+            "mse": (err**2).mean(dim=SPATIAL_DIMS),
+            "mae": np.abs(err).mean(dim=SPATIAL_DIMS),
+            "ssim": ssim_field(f, o, data_range=ssim_data_range, sigma=ssim_sigma),
+        }
+        for name, window in (("small", fss_window_small), ("large", fss_window_large)):
+            comps = fss_components(f, o, threshold=fss_threshold, window=window)
+            for comp_name, comp in zip(("fcst", "obs", "diff"), comps):
+                metrics[f"fss_{name}_{comp_name}"] = comp
+        ds = xr.Dataset(metrics)
+        # Missing data is never scored
+        ds = ds.where(valid).assign(valid=metrics["valid"])
+        per_lead.append(ds)
+
+    metrics = xr.concat(per_lead, dim=fcst["lead_time"]).transpose("time", "lead_time")
+    metrics.attrs = {
+        "fss_threshold_W_m-2": fss_threshold,
+        "fss_window_small": list(fss_window_small),
+        "fss_window_large": list(fss_window_large),
+        "ssim_data_range_W_m-2": ssim_data_range,
+        "ssim_sigma": ssim_sigma,
+        "note": (
+            "time is the issue time. Metrics are per forecast and NaN where valid == 0 "
+            "(incomplete truth or forecast field). FSS = 1 - sum(diff) / (sum(fcst) + "
+            "sum(obs)), summed over the forecasts being aggregated."
+        ),
+    }
+    return metrics
 
 
 # DAILY PROCESSING
-def calc_daily_metrics(date: pd.Timestamp) -> tuple[xr.Dataset, xr.Dataset] | None:
-    """Return (GSO-OF, DiT) metrics for one day, or None if any input data is missing."""
-    day_dir = Path(f"{date.year}/{date.month:02d}/{date.day:02d}")
+def _day_dir(date: pd.Timestamp) -> Path:
+    return Path(f"{date.year}/{date.month:02d}/{date.day:02d}")
 
-    dit_files = sorted((DIT_DIR / day_dir).glob("*.nc"))
-    gso_of_files = sorted((GSO_OF_DIR / day_dir).rglob("*.nc"))
-    truth_files = sorted((TRUTH_DIR / day_dir).rglob("*.nc"))
-    if not (dit_files and gso_of_files and truth_files):
-        LOG.info(f"Skipping {date.date()}: missing data")
+
+def calc_daily_metrics(date: pd.Timestamp) -> dict[str, xr.Dataset] | None:
+    """Return {model name: metrics} for one UTC day, or None if there is nothing to score."""
+    dit_files = sorted((DIT_DIR / _day_dir(date)).glob("*.nc"))
+    if not dit_files:
+        LOG.warning(f"Skipping {date.date()}: no DiT files in {DIT_DIR / _day_dir(date)}")
         return None
+    issue_times = {nowcast_preprocess.file_name_to_datetime64(f) for f in dit_files}
+    issue_times = set(pd.DatetimeIndex(list(issue_times)))
 
-    LOG.info(f"Calculating metrics for {date.date()}")
+    LOG.info(f"Calculating metrics for {date.date()} ({len(dit_files)} DiT issue times)")
 
     dit = open_files(dit_files, preprocess_dit)
     LOG.info("Loaded DiT nowcasts")
 
-    # Use the DiT domain as the region for the other datasets
+    # Use the DiT domain, minus a buffer, as the region for all datasets
     bounds = {
-        "lat_min": dit["latitude"].min().item(),
-        "lat_max": dit["latitude"].max().item(),
-        "lon_min": dit["longitude"].min().item(),
-        "lon_max": dit["longitude"].max().item(),
+        "lat_min": dit["latitude"].min().item() + DOMAIN_BUFFER,
+        "lat_max": dit["latitude"].max().item() - DOMAIN_BUFFER,
+        "lon_min": dit["longitude"].min().item() + DOMAIN_BUFFER,
+        "lon_max": dit["longitude"].max().item() - DOMAIN_BUFFER,
     }
+    dit = _crop_to_region(dit, bounds)
 
-    gso_of = open_files(gso_of_files, partial(preprocess_gso_of, bounds=bounds))
-    LOG.info("Loaded GSO-OF nowcasts")
+    # Truth for valid times up to issue time + max lead time. These span two local-day
+    # truth directories, so search both and keep only the valid times that are needed.
+    valid_times = {
+        t + pd.Timedelta(lead) for t in issue_times for lead in dit["lead_time"].values
+    }
+    truth_files = [
+        f
+        for d in (date, date + pd.Timedelta(days=1))
+        for f in sorted((TRUTH_DIR / _day_dir(d)).glob("*.nc"))
+        if _truth_file_time(f) in valid_times
+    ]
+    if not truth_files:
+        LOG.warning(f"Skipping {date.date()}: no truth files for the DiT valid times")
+        return None
     truth = open_files(truth_files, partial(preprocess_truth, bounds=bounds))
-    LOG.info("Loaded truth data")
+    LOG.info(f"Loaded truth data ({len(truth_files)}/{len(valid_times)} valid times found)")
 
-    results = []
-    for nowcast in (gso_of, dit):
+    nowcasts = {"CPDiT": dit}
+
+    # GSO-OF only at the DiT issue times, so both models are scored on the same forecasts
+    gso_of_files = _files_at_times(
+        sorted((GSO_OF_DIR / _day_dir(date)).glob("*.nc")), issue_times, "%Y%m%dT%H%M%S"
+    )
+    if gso_of_files:
+        nowcasts["GSO_OF"] = open_files(gso_of_files, partial(preprocess_gso_of, bounds=bounds))
+        LOG.info(f"Loaded GSO-OF nowcasts ({len(gso_of_files)}/{len(issue_times)} issue times)")
+    else:
+        LOG.warning(f"No GSO-OF files at the DiT issue times on {date.date()}")
+
+    results = {}
+    for name, nowcast in nowcasts.items():
         metrics = calc_error_metrics(nowcast[VARIABLE], truth[VARIABLE])
-        # Lead time in minutes, and the day as a dimension for concatenating days
-        metrics = metrics.assign_coords(lead_time=metrics["lead_time"] / np.timedelta64(1, "m"))
-        results.append(metrics.expand_dims(date=[date]))
-    LOG.info("Calculated metrics")
+        # Lead time in minutes
+        results[name] = metrics.assign_coords(
+            lead_time=metrics["lead_time"] / np.timedelta64(1, "m")
+        )
+        n_valid = int(metrics["valid"].sum())
+        LOG.info(f"Calculated {name} metrics: {n_valid}/{metrics['valid'].size} forecasts valid")
 
-    return tuple(results)
+    return results
 
 
-def main(year: int) -> None:
-    daily_of, daily_dit = [], []
-    for date in pd.date_range(f"{year}-01-01", f"{year}-12-31"):
-        daily = calc_daily_metrics(date)
-        if daily is None:
-            continue
-        daily_of.append(daily[0])
-        daily_dit.append(daily[1])
+def main(date: pd.Timestamp, save_dir: Path) -> None:
+    metrics = calc_daily_metrics(date)
 
-    if not daily_of:
-        LOG.error(f"No days with complete data found for {year}")
+    if not metrics:
+        LOG.info(f"No data for {date.date()}")
         return
 
-    # JOIN DAILY DATA INTO COMBINED DATASETS
-    of_metrics = xr.concat(daily_of, dim="date")
-    dit_metrics = xr.concat(daily_dit, dim="date")
-    LOG.info(f"Concatenated daily metrics into full datasets for {year}")
-
-    # SAVE METRICS AS NETCDF
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    LOG.info("Saving GSO-OF metrics...")
-    of_metrics.to_netcdf(SAVE_DIR / f"gso-of_metrics_{year}.nc")
-    LOG.info("Saving DiT metrics...")
-    dit_metrics.to_netcdf(SAVE_DIR / f"dit_metrics_{year}.nc")
+    for name, ds in metrics.items():
+        out_dir = save_dir / name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        LOG.info(f"Saving {name} metrics...")
+        ds.to_netcdf(out_dir / f"{date.year}{date.month:02d}{date.day:02d}.nc")
     LOG.info("Saved metrics to netcdf files.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--year", type=int, default=2025)
+    parser.add_argument("--date", type=str, default="2025-01-01")
     parser.add_argument("--n-workers", type=int, default=24)
+    parser.add_argument("--save-dir", type=Path, default=SAVE_DIR)
     args = parser.parse_args()
 
     with Client(n_workers=args.n_workers, threads_per_worker=1):
-        main(args.year)
+        main(pd.Timestamp(args.date), args.save_dir)
