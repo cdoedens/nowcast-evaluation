@@ -184,7 +184,7 @@ def ssim_field(f: xr.DataArray, o: xr.DataArray, data_range: float, sigma: float
 def calc_error_metrics(
     fcst: xr.DataArray,
     obs: xr.DataArray,
-    fss_threshold: float = 500,  # W/m2
+    fss_threshold: float = 250,  # W/m2
     fss_window_small: tuple[int, int] = (5, 5),  # height * width
     fss_window_large: tuple[int, int] = (100, 100),  # height * width
     ssim_data_range: float = 1200,  # W/m2, range of values in image
