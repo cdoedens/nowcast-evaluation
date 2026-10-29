@@ -26,7 +26,7 @@ for date in pd.date_range("2025-01-01", "2025-12-31"):
         f3.write('#PBS -l mem=46GB \n')
         f3.write('#PBS -l ncpus=12 \n')
         f3.write('#PBS -l jobfs=10GB \n')
-        f3.write('#PBS -l storage=gdata/xp65+gdata/rv74+scratch/er8+gdata/er8 \n')
+        f3.write('#PBS -l storage=gdata/xp65+gdata/rv74+scratch/er8+gdata/er8+gdata/ob53 \n')
         f3.write('#PBS -l other=hyperthread \n')
         f3.write('#PBS -q normal \n')
         f3.write('#PBS -P er8 \n')
