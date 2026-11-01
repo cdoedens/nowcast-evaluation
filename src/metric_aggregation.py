@@ -12,6 +12,7 @@ Typical use:
 """
 
 import operator
+import warnings
 from functools import reduce
 from pathlib import Path
 
@@ -19,9 +20,26 @@ import numpy as np
 import xarray as xr
 
 
+def _is_per_forecast(path: Path) -> bool:
+    with xr.open_dataset(path) as ds:
+        return "time" in ds.dims and "valid" in ds
+
+
 def load_metrics(model_dir: Path) -> xr.Dataset:
-    """Open all daily per-forecast metric files for one model, concatenated on issue time."""
+    """Open all daily per-forecast metric files for one model, concatenated on issue time.
+
+    Files without per-forecast metrics (no `time` dim or `valid` flag) are skipped. These are
+    left over from older versions of calculate-metrics.py, which saved daily aggregates on a
+    `date` dim, and survive a rerun on days where that model had no forecasts to score.
+    """
     files = sorted(Path(model_dir).glob("*.nc"))
+    stale = [f for f in files if not _is_per_forecast(f)]
+    if stale:
+        warnings.warn(
+            f"Skipping {len(stale)} file(s) in {model_dir} without per-forecast metrics: "
+            + ", ".join(f.name for f in stale)
+        )
+    files = [f for f in files if f not in stale]
     return xr.open_mfdataset(files, combine="nested", concat_dim="time").load()
 
 
@@ -45,10 +63,10 @@ def common_sample(
     }
 
 
-def _pooled_fss(ds: xr.Dataset, window: str, dim: str) -> xr.DataArray:
-    fcst = ds[f"fss_{window}_fcst"].sum(dim)
-    obs = ds[f"fss_{window}_obs"].sum(dim)
-    diff = ds[f"fss_{window}_diff"].sum(dim)
+def _pooled_fss(ds: xr.Dataset, window: str, level: str, dim: str) -> xr.DataArray:
+    fcst = ds[f"fss_{window}_{level}_fcst"].sum(dim)
+    obs = ds[f"fss_{window}_{level}_obs"].sum(dim)
+    diff = ds[f"fss_{window}_{level}_diff"].sum(dim)
     denom = fcst + obs
     # FSS is undefined when no events were forecast or observed
     return (1 - diff / denom).where(denom > 0)
@@ -57,18 +75,25 @@ def _pooled_fss(ds: xr.Dataset, window: str, dim: str) -> xr.DataArray:
 def aggregate(ds: xr.Dataset, dim: str = "time") -> xr.Dataset:
     """Aggregate per-forecast metrics over `dim`, weighting every valid forecast equally.
 
-    Returns the number of valid forecasts, RMSE (root of the pooled MSE), MAE, mean SSIM
-    and pooled FSS for the small and large windows.
+    Returns the number of valid forecasts, RMSE (root of the pooled MSE), MAE, mean SSIM,
+    mean CRPS (ensemble models only) and pooled FSS (clear-sky index) for the small and
+    large windows at the light (0.8) and deep (0.5) cloud thresholds, named e.g.
+    `fss_small_light`.
     """
     valid = ds["valid"].fillna(0).astype(bool)
     ds = ds.where(valid)
     return xr.Dataset(
         {
             "n": valid.sum(dim),
-            "rmse": np.sqrt(ds["mse"].mean(dim)),
+            # Every field has the same number of pixels, so this is the pooled RMSE
+            "rmse": np.sqrt((ds["rmse"] ** 2).mean(dim)),
             "mae": ds["mae"].mean(dim),
             "ssim": ds["ssim"].mean(dim),
-            "fss_small": _pooled_fss(ds, "small", dim),
-            "fss_large": _pooled_fss(ds, "large", dim),
+            **({"crps": ds["crps"].mean(dim)} if "crps" in ds else {}),
+            **{
+                f"fss_{window}_{level}": _pooled_fss(ds, window, level, dim)
+                for window in ("small", "large")
+                for level in ("light", "deep")
+            },
         }
     )
