@@ -1,0 +1,15 @@
+#!/bin/bash 
+#PBS -l walltime=6:00:00 
+#PBS -l mem=46GB 
+#PBS -l ncpus=12 
+#PBS -l jobfs=10GB 
+#PBS -l storage=gdata/xp65+gdata/rv74+scratch/er8+gdata/er8+gdata/ob53 
+#PBS -l other=hyperthread 
+#PBS -q normal 
+#PBS -P er8 
+#PBS -o /home/548/cd3022/repos/nowcast-evaluation/outputs/logs/calculate-power-spectra/2025.log 
+#PBS -j oe 
+cd /home/548/cd3022/repos/nowcast-evaluation 
+source env.sh 
+python3 scripts/calculate-power-spectra.py --date 2025-01-01 --end-date 2025-12-31
+
